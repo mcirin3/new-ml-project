@@ -94,7 +94,7 @@ TEAM_ID=YOUR_TEAM_ID
 ```
 
 ### How to find .env file values: 
-Step 1 — Get SWID and espn_s2 Cookies
+## Step 1 — Get SWID and espn_s2 Cookies
 Log into your ESPN Fantasy Football account in Chrome, Edge, or Safari.
 
 Navigate to your fantasy league homepage.
@@ -116,12 +116,13 @@ espn_s2 → Paste into ESPN_S2.
 ## Step 2 — Get LEAGUE_ID
 While on your league page, check the URL:
 
-arduino
-Copy code
+
+For example:
+```bash
 https://fantasy.espn.com/football/team?leagueId=1256311277&teamId=9
 The number after leagueId= is your LEAGUE_ID.
-
-### Train Custom Model 
+```
+## Train Custom Model 
 If you want to train a custom model, run the following command:
 ```bash
 cd tools 
