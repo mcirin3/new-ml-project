@@ -5,7 +5,7 @@ This project is a **Streamlit web application** that optimizes a fantasy footbal
 
 ---
 
-## Features Implemented ✅
+## Features Implemented 
 
 ### 1. Data Loading & Preprocessing
 - **2024 Season Totals**:
@@ -52,8 +52,7 @@ This project is a **Streamlit web application** that optimizes a fantasy footbal
 
 ---
 
-## Planned Enhancements 🚀
-- **Custom Model Training** UI: Allow training directly from the app.
+## Planned Enhancements 
 - **Historical Matchup Results**: Show past matchups and scores.
 - **Matchup-Aware Optimization**: Adjust starter choices based on opponent’s strength at each position.
 - **Injury/News Integration**: Reduce projections for injured players.
