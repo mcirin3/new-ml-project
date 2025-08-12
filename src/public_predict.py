@@ -1,185 +1,219 @@
 # src/public_predict.py
-from pathlib import Path
+from typing import List, Tuple, Dict
+import json
 import pandas as pd
-import joblib
-
-from nfl_data_py import import_weekly_data
+import requests
 from rapidfuzz import process, fuzz
 
-from .roster import get_current_roster
-from .public_train import MODEL_OUT, _ensure_fppr, SKILL_POS, train_public
-from .public_special import kicker_rolling_projection, dst_rolling_projection
+from .espn_client import get_team
+from .roster import get_current_roster  # used as an additional name source
 
-from urllib.error import HTTPError
-from nfl_data_py import import_weekly_data
+POS_MAP = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "D/ST"}
+TEAM_MAP = {
+    0:"FA",1:"ATL",2:"BUF",3:"CHI",4:"CIN",5:"CLE",6:"DAL",7:"DEN",8:"DET",
+    9:"GB",10:"TEN",11:"IND",12:"KC",13:"LV",14:"LAR",15:"MIA",16:"MIN",17:"NE",
+    18:"NO",19:"NYG",20:"NYJ",21:"PHI",22:"ARI",23:"PIT",24:"LAC",25:"SF",26:"SEA",
+    27:"TB",28:"WSH",29:"CAR",30:"JAX",33:"BAL",34:"HOU"
+}
 
-MAX_PUBLIC_YEAR = 2024  # bump this once nflfastR publishes 2025 weekly
+def _norm(s: str) -> str:
+    if not isinstance(s, str): return ""
+    return (s.lower()
+            .replace(" jr.", "").replace(" sr.", "")
+            .replace(".", "").replace("'", "")
+            .replace("-", " ").replace("  ", " ").strip())
 
-def import_weekly_safe(years):
-    """Import weekly data, skipping years that 404 (not published yet)."""
-    ok_years = []
-    for y in years:
-        if y <= MAX_PUBLIC_YEAR:
-            ok_years.append(y)
-    if not ok_years:
-        raise RuntimeError(f"No public weekly data available for years={years}. Try <= {MAX_PUBLIC_YEAR}.")
-    try:
-        return import_weekly_data(ok_years)
-    except HTTPError as e:
-        # Extremely defensive; if a year inside ok_years still 404s, drop it one-by-one
-        agg = []
-        for y in ok_years:
-            try:
-                agg.append(import_weekly_data([y]))
-            except HTTPError:
-                pass
-        if not agg:
-            raise
-        return pd.concat(agg, ignore_index=True)
-def _resolve_cols(df):
-    """Return (team_col, opp_col, pos_col, name_col) that exist in this dataframe."""
-    team_col = next((c for c in ["recent_team", "team", "posteam"] if c in df.columns), None)
-    opp_col  = next((c for c in ["opponent_team", "opp_team", "defteam"] if c in df.columns), None)
-    pos_col  = "position" if "position" in df.columns else ("pos" if "pos" in df.columns else None)
-    name_col = "player_display_name" if "player_display_name" in df.columns else (
-               "player_name" if "player_name" in df.columns else None)
-    return team_col, opp_col, pos_col, name_col
+def _espn_players(season: int, week: int, scoring_id: int = 4) -> pd.DataFrame:
+    url = (
+        f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/"
+        f"seasons/{season}/segments/0/leaguedefaults/{scoring_id}"
+        f"?scoringPeriodId={week}&view=kona_player_info"
+    )
+    xff = {"players": {"limit": 2000, "sortPercOwned": {"sortPriority": 1, "sortAsc": False}}}
+    headers = {"Accept": "application/json", "X-Fantasy-Filter": json.dumps(xff)}
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    players = data.get("players", data)
 
+    rows = []
+    for p in players:
+        info = p.get("player", p)
+        pid = info.get("id")
+        full = info.get("fullName") or info.get("name") or ""
+        pos_id = info.get("defaultPositionId", 0)
+        pos = POS_MAP.get(pos_id, "")
+        team = TEAM_MAP.get(info.get("proTeamId", 0), "FA")
 
-def _build_skill_feature_rows(weekly: pd.DataFrame, player_ids, week: int) -> pd.DataFrame:
-    """Assemble rolling features for the target week for the given player_ids."""
-    team_col, opp_col, pos_col, name_col = _resolve_cols(weekly)
+        proj_week = 0.0
+        for s in info.get("stats", []):
+            if s.get("seasonId") == season and s.get("statSourceId") == 1:
+                at = s.get("appliedTotal")
+                if isinstance(at, (int, float)):
+                    proj_week = float(at)
 
-    df = weekly[weekly["player_id"].isin(player_ids)].copy()
-    if df.empty:
-        return pd.DataFrame(columns=["player_id","player_display_name","position","week"])
+        rows.append({
+            "player_id": pd.to_numeric(pid, errors="coerce"),
+            "player_name": full,
+            "position": pos,
+            "pro_team": team,
+            "proj_week": proj_week,
+            "name_key": _norm(full),
+        })
 
-    # Normalize required columns
-    if pos_col and pos_col != "position":
-        df.rename(columns={pos_col: "position"}, inplace=True)
-    if name_col and name_col != "player_display_name":
-        df.rename(columns={name_col: "player_display_name"}, inplace=True)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["player_id"] = df["player_id"].astype("Int64")
+    return df
 
-    df["fantasy_ppr"] = _ensure_fppr(df)
-    df.sort_values(["player_id", "week"], inplace=True)
+def _extract_team_roster() -> List[Tuple[int | None, str, str]]:
+    """
+    Return list of (player_id, name, position) for YOUR team using espn_api,
+    with broad attribute fallbacks to handle library differences.
+    """
+    team = get_team()
+    out: List[Tuple[int | None, str, str]] = []
 
-    # rolling recent form (no leakage)
-    df["r3_mean"] = df.groupby("player_id")["fantasy_ppr"].shift(1).rolling(3, min_periods=1).mean()
-    df["r5_mean"] = df.groupby("player_id")["fantasy_ppr"].shift(1).rolling(5, min_periods=1).mean()
+    for p in getattr(team, "roster", []):
+        # id fallbacks
+        pid = getattr(p, "player_id", None)
+        if pid is None: pid = getattr(p, "id", None)
+        if pid is None: pid = getattr(p, "playerId", None)
 
-    # opponent vs position last 4 weeks
-    if opp_col is None:
-        opp_col = "defteam" if "defteam" in df.columns else None
+        # name fallbacks
+        name = getattr(p, "name", None)
+        if not name: name = getattr(p, "playerName", None)
+        if not name: name = getattr(p, "fullName", None)
+        if not name: name = str(pid) if pid is not None else ""
 
-    if opp_col and "position" in df.columns:
-        tmp = (
-            df.groupby([opp_col, "position", "week"])["fantasy_ppr"].mean()
-              .groupby(level=[0, 1]).rolling(4, min_periods=1).mean()
-              .reset_index().rename(columns={"fantasy_ppr": "opp_pos_r4"})
-        )
-        df = df.merge(tmp, left_on=[opp_col, "position", "week"],
-                          right_on=[opp_col, "position", "week"], how="left")
-    else:
-        df["opp_pos_r4"] = 0.0
+        # position fallbacks
+        pos = getattr(p, "position", None)
+        if not pos:
+            # sometimes the slot position is available
+            pos = getattr(p, "eligibleSlots", None)
+            if isinstance(pos, list) and pos:
+                # crude best guess: first skill-ish slot
+                for code in pos:
+                    # QB/RB/WR/TE/K/DST are primary
+                    if code in [0,2,4,6,17,16]:  # league slot codes vary; harmless if wrong
+                        break
+                pos = str(code)
+        # ensure text pos
+        pos = str(pos).upper()
+        # normalize DST variants
+        if pos in {"DEF", "DST"}:
+            pos = "D/ST"
 
-    # opportunity (ok if absent)
-    if "rush_att" in df.columns:
-        df["rush_att_r3"] = df.groupby("player_id")["rush_att"].shift(1).rolling(3, min_periods=1).mean()
-    else:
-        df["rush_att_r3"] = 0.0
-    if "targets" in df.columns:
-        df["targets_r3"]  = df.groupby("player_id")["targets"].shift(1).rolling(3, min_periods=1).mean()
-    else:
-        df["targets_r3"] = 0.0
-    if "pass_att" in df.columns:
-        df["pass_att_r3"] = df.groupby("player_id")["pass_att"].shift(1).rolling(3, min_periods=1).mean()
-    else:
-        df["pass_att_r3"] = 0.0
+        try:
+            pid_num = int(pid) if pid is not None else None
+        except Exception:
+            pid_num = None
 
-    # take the target week rows
-    feat_week = df[df["week"] == week].copy()
-    return feat_week.fillna(0)
+        out.append((pid_num, name, pos))
+    return out
 
+def _fuzzy_ids_from_names(names: List[Tuple[str, str]], pool: pd.DataFrame) -> List[int]:
+    """Match roster names to pool by normalized name; ignore position if necessary."""
+    if pool.empty:
+        return []
+    pool = pool.copy()
+    pool["name_key"] = pool["name_key"].fillna("").astype(str)
+    cand = pool["name_key"].tolist()
+    got: List[int] = []
+    for nm, pos in names:
+        target = _norm(nm)
+        if not target:
+            continue
+        m = process.extractOne(target, cand, scorer=fuzz.WRatio)
+        if m and m[1] >= 80:
+            got.append(int(pool.iloc[m[2]]["player_id"]))
+    return list(dict.fromkeys(got))  # unique preserve order-ish
 
 def predict_public(season: int, week: int) -> pd.DataFrame:
-    """
-    Predict your current roster’s points for (season, week) using:
-      - ML model trained on public data for skill positions (QB/RB/WR/TE)
-      - Rolling baselines for K and D/ST
-    Returns columns: player_id, player_name, pos, pred_points, floor, ceiling
-    """
-    roster = get_current_roster()
+    pool = _espn_players(season=season, week=week, scoring_id=4)
 
-    # Ensure skill model exists; train on first run (2020-2024 history of your players)
-    if not Path(MODEL_OUT).exists():
-        train_public(roster["skill"], seasons=(2020, 2024))
+    # 1) Get your roster (IDs + names)
+    roster_items = _extract_team_roster()
+    # split by pos groups we care about
+    skill_ids, k_ids, dst_codes = [], [], []
+    names_for_fuzzy: List[Tuple[str, str]] = []
 
-    model, feats, mapping = joblib.load(MODEL_OUT)
-    skill_ids = [v["player_id"] for v in mapping.values()]
+    for pid, name, pos in roster_items:
+        if pos in {"QB","RB","WR","TE"}:
+            if pid is not None:
+                skill_ids.append(pid)
+            names_for_fuzzy.append((name, pos))
+        elif pos == "K":
+            if pid is not None:
+                k_ids.append(pid)
+            names_for_fuzzy.append((name, pos))
+        elif pos in {"D/ST","DST","DEF"}:
+            # use team code if we can infer it later from name (fallback in pool by D/ST position + team)
+            # we will not rely on pid for DST
+            pass
+        else:
+            # unknown pos? still try to include via name match
+            names_for_fuzzy.append((name, pos))
 
-    # Current season weekly data (schema-flexible)
-    weekly = import_weekly_safe([season])
+    # 2) If we missed any IDs, backfill by name against the pool
+    if pool.empty:
+        return pd.DataFrame(columns=["player_id","player_name","pos","pro_team","pred_points","floor","ceiling"])
 
-    # ==== Skill positions (ML) ====
-    skill_feat = _build_skill_feature_rows(weekly, skill_ids, week)
-    skill_preds = pd.DataFrame(columns=["player_id","player_name","pos","pred_points"])
-    if not skill_feat.empty:
-        # Only keep skill positions we trained on
-        skill_feat = skill_feat[skill_feat["position"].isin(SKILL_POS)]
-        if not skill_feat.empty:
-            preds = model.predict(skill_feat[feats])
-            names = skill_feat.get("player_display_name", skill_feat.get("player_name", skill_feat["player_id"]))
-            skill_preds = pd.DataFrame({
-                "player_id": skill_feat["player_id"].values,
-                "player_name": names.values,
-                "pos": skill_feat["position"].values,
-                "pred_points": preds,
+    if not skill_ids:
+        back = _fuzzy_ids_from_names([(n,p) for (n,p) in names_for_fuzzy if p in {"QB","RB","WR","TE"}], pool)
+        skill_ids = back or skill_ids
+    if not k_ids:
+        back = _fuzzy_ids_from_names([(n,"K") for (n,p) in names_for_fuzzy if p == "K"], pool)
+        k_ids = back or k_ids
+
+    blocks = []
+
+    # 3) Skill + K by IDs
+    need_ids = list(dict.fromkeys([*skill_ids, *k_ids]))
+    if need_ids:
+        sel = pool[pool["player_id"].isin(need_ids)].copy()
+        if not sel.empty:
+            block = pd.DataFrame({
+                "player_id": sel["player_id"].astype("Int64"),
+                "player_name": sel["player_name"],
+                "pos": sel["position"],
+                "pro_team": sel["pro_team"],
+                "pred_points": sel["proj_week"].fillna(0.0),
             })
+            blocks.append(block)
 
-    # ==== Kickers (rolling baseline) ====
-    k_names = [n for (n, p) in roster["kickers"]]
-    k_block = pd.DataFrame(columns=["player_id","player_name","pos","pred_points"])
-    if k_names:
-        # Build name->id mapping from weekly (position K)
-        team_col, opp_col, pos_col, name_col = _resolve_cols(weekly)
-        kpool = weekly[weekly.get(pos_col or "position", "position") == "K"] if pos_col else weekly[weekly["position"]=="K"]
-        if not kpool.empty:
-            kp = kpool[["player_id", name_col or "player_display_name"]].dropna().drop_duplicates("player_id")
-            disp_col = name_col or "player_display_name"
-            names_list = kp[disp_col].tolist()
-            kid_map = {}
-            for n in k_names:
-                m = process.extractOne(n, names_list, scorer=fuzz.WRatio)
-                if m:
-                    matched, _, _ = m
-                    pid = kp.loc[kp[disp_col] == matched, "player_id"].iloc[0]
-                    kid_map[n] = pid
-            k_ids = list(kid_map.values())
-            if k_ids:
-                kdf = kicker_rolling_projection(season, week, k_ids)
-                if not kdf.empty:
-                    kmerge = kdf.merge(kp, on="player_id", how="left")
-                    kmerge.rename(columns={disp_col: "player_name"}, inplace=True)
-                    kmerge["pos"] = "K"
-                    k_block = kmerge[["player_id","player_name","pos","pred_points"]]
+    # 4) D/ST — choose the D/ST that matches your team roster’s defense name (by team code in pool)
+    # If your roster has a D/ST player object, its team abbrev usually appears in the name.
+    # Simpler: just include ALL D/ST that are owned by you? The team library doesn’t expose that cleanly.
+    # So we include *any* D/ST that matches your team’s rostered defense name by fuzzy match.
+    # Extra safety: if your team doesn’t have a DST in roster_items, skip.
+    dst_names = [nm for (_pid, nm, pos) in roster_items if pos in {"D/ST","DST","DEF"}]
+    if dst_names:
+        dst_pool = pool[pool["position"] == "D/ST"].copy()
+        dst_pool["name_key"] = dst_pool["name_key"].fillna("")
+        cand = dst_pool["name_key"].tolist()
+        for nm in dst_names:
+            m = process.extractOne(_norm(nm), cand, scorer=fuzz.WRatio)
+            if m and m[1] >= 75:
+                row = dst_pool.iloc[m[2]]
+                blocks.append(pd.DataFrame({
+                    "player_id": [row["player_id"]],
+                    "player_name": [row["player_name"]],
+                    "pos": ["D/ST"],
+                    "pro_team": [row["pro_team"]],
+                    "pred_points": [row["proj_week"] if pd.notnull(row["proj_week"]) else 0.0],
+                }))
 
-    # ==== D/ST (rolling baseline by team code) ====
-    dst_codes = roster["dst"]  # e.g., ["MIN"]
-    dst_block = pd.DataFrame(columns=["player_id","player_name","pos","pred_points"])
-    if dst_codes:
-        ddf = dst_rolling_projection(season, week, dst_codes)
-        if not ddf.empty:
-            ddf = ddf.rename(columns={"team": "player_name"})
-            ddf["pos"] = "D/ST"
-            ddf["player_id"] = ddf["player_name"]
-            dst_block = ddf[["player_id","player_name","pos","pred_points"]]
+    out = pd.concat(blocks, ignore_index=True) if blocks else pd.DataFrame(
+        columns=["player_id","player_name","pos","pro_team","pred_points"]
+    )
+    if out.empty:
+        # keep downstream happy
+        out["floor"] = pd.Series(dtype=float)
+        out["ceiling"] = pd.Series(dtype=float)
+        return out
 
-    # ==== Combine and add bands ====
-    out = pd.concat([skill_preds, k_block, dst_block], ignore_index=True)
-    out.drop_duplicates(subset=["player_id","pos"], inplace=True)
-
-    # Simple uncertainty band
-    out["floor"] = (out["pred_points"] * 0.8).clip(lower=0)
+    out = out.drop_duplicates(subset=["player_id","pos"])
+    out["floor"] = (out["pred_points"] * 0.80).clip(lower=0)
     out["ceiling"] = out["pred_points"] * 1.25
-
     return out
