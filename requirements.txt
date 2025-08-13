@@ -23,3 +23,5 @@ pulp>=2.8              # LP solver wrapper (needs CBC installed system-wide)
 # HTML parsing (optional but handy for any scraping utilities you kept)
 beautifulsoup4>=4.12
 lxml>=5.2
+
+#final
